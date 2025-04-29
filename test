@@ -1,0 +1,82 @@
+#include <opencv2/opencv.hpp>
+#include <iostream>
+
+using namespace cv;
+using namespace std;
+
+bool photo_taken = false;
+bool input_mode = false;
+Mat frame, captured_image;
+Rect photo_button_rect, upload_button_rect;
+bool show_photo_button = true, show_upload_button = true;
+
+void drawButtons(Mat& img) {
+    if (show_photo_button) {
+        photo_button_rect = Rect(img.cols / 2 - 40, img.rows - 100, 80, 80);
+        circle(img, Point(photo_button_rect.x + 40, photo_button_rect.y + 40), 40, Scalar(255, 255, 255), -1);
+    }
+    if (show_upload_button) {
+        upload_button_rect = Rect(20, img.rows - 100, 80, 80);
+        rectangle(img, upload_button_rect, Scalar(255, 255, 255), -1);
+    }
+}
+
+bool isInsideRect(Point p, Rect r) {
+    return (p.x >= r.x && p.x <= r.x + r.width && p.y >= r.y && p.y <= r.y + r.height);
+}
+
+void mouseHandler(int event, int x, int y, int flags, void*) {
+    if (event == EVENT_LBUTTONDOWN && !photo_taken && !input_mode) {
+        Point click(x, y);
+        if (show_photo_button && isInsideRect(click, photo_button_rect)) {
+            captured_image = frame.clone();
+            photo_taken = true;
+            show_photo_button = false;
+            show_upload_button = false;
+        } else if (show_upload_button && isInsideRect(click, upload_button_rect)) {
+            input_mode = true;
+            destroyAllWindows();
+            string path;
+            cout << "請輸入圖片相對路徑：";
+            cin >> path;
+            Mat img = imread(path);
+            if (!img.empty()) {
+                namedWindow("Uploaded Image", WINDOW_AUTOSIZE);
+                imshow("Uploaded Image", img);
+            } else {
+                cout << "無法讀取圖片，請檢查路徑！\n";
+            }
+            show_photo_button = false;
+            show_upload_button = false;
+        }
+    }
+}
+
+int main() {
+    VideoCapture cap(0);
+    if (!cap.isOpened()) {
+        cerr << "無法開啟攝影機！\n";
+        return -1;
+    }
+
+    namedWindow("IG Camera", WINDOW_NORMAL);
+    resizeWindow("IG Camera", 480, 640);
+    setMouseCallback("IG Camera", mouseHandler);
+
+    while (true) {
+        if (!photo_taken && !input_mode) {
+            cap >> frame;
+            if (frame.empty()) break;
+            drawButtons(frame);
+            imshow("IG Camera", frame);
+        } else if (photo_taken) {
+            imshow("IG Camera", captured_image);
+        }
+
+        char key = waitKey(30);
+        if (key == 27) break; // ESC
+    }
+    cap.release();
+    destroyAllWindows();
+    return 0;
+}
