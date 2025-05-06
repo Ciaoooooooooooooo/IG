@@ -1,0 +1,147 @@
+#include <opencv2/opencv.hpp>
+#include <iostream>
+
+using namespace cv;
+using namespace std;
+
+bool photo_taken = false;
+bool input_mode = false;
+Mat frame, captured_image;
+Rect photo_button_rect, upload_button_rect;
+bool show_photo_button = true, show_upload_button = true;
+
+const int output_width = 324;
+const int output_height = 576; // 9:16 的畫面
+
+Rect getCentralCropRect(Size originalSize) {
+    float input_aspect = (float)originalSize.width / originalSize.height;
+    float target_aspect = 9.0f / 16.0f;
+
+    int new_width = originalSize.width;
+    int new_height = originalSize.height;
+
+    if (input_aspect > target_aspect) {
+        new_width = int(originalSize.height * target_aspect);
+    }
+    else {
+        new_height = int(originalSize.width / target_aspect);
+    }
+
+    int x = (originalSize.width - new_width) / 2;
+    int y = (originalSize.height - new_height) / 2;
+
+    return Rect(x, y, new_width, new_height);
+}
+
+Mat cropTo916(Mat& img) {
+    Rect crop = getCentralCropRect(img.size());
+    Mat cropped = img(crop).clone();
+    resize(cropped, cropped, Size(output_width, output_height));
+    return cropped;
+}
+
+void drawButtons(Mat& img) {
+    if (show_photo_button) {
+        photo_button_rect = Rect(img.cols / 2 - 40, img.rows - 115, 80, 80);
+        circle(img, Point(photo_button_rect.x + 40, photo_button_rect.y + 40), 30, Scalar(255, 255, 255), -1);
+    }
+    if (show_upload_button) {
+        upload_button_rect = Rect(20, img.rows - 100, 60, 60);
+        rectangle(img, upload_button_rect, Scalar(0, 0, 0), -1);
+    }
+}
+
+bool isInsideRect(Point p, Rect r) {
+    return (p.x >= r.x && p.x <= r.x + r.width && p.y >= r.y && p.y <= r.y + r.height);
+}
+
+Mat resizeAndFitImage(Mat& img) {
+    float input_aspect = (float)img.cols / img.rows;
+    float target_aspect = 9.0f / 16.0f;
+
+    Mat result(output_height, output_width, CV_8UC3, Scalar(255, 255, 255));
+    Mat resized;
+
+    if (input_aspect > target_aspect) {
+        // 橫式：縮放寬度相同，置中貼圖
+        int new_width = output_width;
+        int new_height = (int)(output_width / input_aspect);
+        resize(img, resized, Size(new_width, new_height));
+        resized.copyTo(result(Rect(0, (output_height - new_height) / 2, new_width, new_height)));
+    }
+    else {
+        // 直式：縮放至填滿
+        resize(img, resized, Size(output_width, output_height));
+        result = resized;
+    }
+
+    return result;
+}
+
+void mouseHandler(int event, int x, int y, int flags, void*) {
+    if (event == EVENT_LBUTTONDOWN && !photo_taken && !input_mode) {
+        Point click(x, y);
+        if (show_photo_button && isInsideRect(click, photo_button_rect)) {
+            captured_image = cropTo916(frame);
+            photo_taken = true;
+            show_photo_button = false;
+            show_upload_button = false;
+        }
+        else if (show_upload_button && isInsideRect(click, upload_button_rect)) {
+            input_mode = true;
+            destroyAllWindows();
+            string path;
+            cout << "請輸入圖片相對路徑：";
+            cin >> path;
+
+            Mat img = imread(path);
+            if (!img.empty()) {
+                captured_image = resizeAndFitImage(img);
+                photo_taken = true;
+            }
+            else {
+                cout << "無法讀取圖片，請檢查路徑！\n";
+            }
+            show_photo_button = false;
+            show_upload_button = false;
+        }
+    }
+}
+
+
+int main() {
+
+    utils::logging::setLogLevel(utils::logging::LOG_LEVEL_ERROR);
+
+
+    VideoCapture cap(0);
+    if (!cap.isOpened()) {
+        cerr << "無法開啟攝影機！\n";
+        return -1;
+    }
+
+    namedWindow("IG Camera", WINDOW_AUTOSIZE);
+    setMouseCallback("IG Camera", mouseHandler);
+
+    while (true) {
+        if (!photo_taken && !input_mode) {
+            cap >> frame;
+            if (frame.empty()) break;
+            Mat display = cropTo916(frame);
+            drawButtons(display);
+            imshow("IG Camera", display);
+            moveWindow("IG Camera", 500, 80);
+        }
+        else if (photo_taken) {
+            imshow("IG Camera", captured_image);
+            moveWindow("IG Camera", 500, 80);
+        }
+
+        char key = waitKey(30);
+        if (key == 27) break; // ESC
+    }
+
+    cap.release();
+    destroyAllWindows();
+    return 0;
+}
