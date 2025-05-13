@@ -1,0 +1,225 @@
+#include <opencv2/opencv.hpp>
+#include <iostream>
+#include <vector>
+#include <string>
+
+using namespace cv;
+using namespace std;
+
+bool photo_taken = false;
+bool input_mode = false;
+bool drawing_mode = false;
+
+Mat frame, captured_image, original_image, drawing_layer;
+Rect photo_button_rect, upload_button_rect, close_button_rect, draw_button_rect;
+bool show_photo_button = true, show_upload_button = true;
+
+const int output_width = 324;
+const int output_height = 576; // 9:16
+
+int filter_mode = 0;
+int brightness = 0;
+int contrast = 100;
+int thresh_value = 127;
+
+// Drawing tool variables
+Point last_point(-1, -1);
+Scalar current_color = Scalar(0, 0, 255); // default red
+int current_tool = 0; // 0=pen, 1=arrow, 2=marker, 3=highlighter, 4=eraser
+int color_page = 0;
+vector<vector<Scalar>> color_pages = {
+    {Scalar(0,0,0), Scalar(255,255,255), Scalar(255,0,0), Scalar(0,255,0), Scalar(0,0,255), Scalar(255,255,0), Scalar(255,0,255), Scalar(0,255,255), Scalar(128,128,128)},
+    {Scalar(0,128,0), Scalar(128,0,0), Scalar(0,0,128), Scalar(128,128,0), Scalar(128,0,128), Scalar(0,128,128), Scalar(192,192,192), Scalar(64,64,64), Scalar(255,128,0)},
+    {Scalar(255,153,204), Scalar(204,255,153), Scalar(153,204,255), Scalar(255,204,153), Scalar(153,255,204), Scalar(204,153,255), Scalar(255,255,204), Scalar(204,255,255), Scalar(255,204,204)},
+    {Scalar(51,0,51), Scalar(102,0,102), Scalar(153,0,153), Scalar(204,0,204), Scalar(255,0,255), Scalar(255,51,255), Scalar(255,102,255), Scalar(255,153,255), Scalar(255,204,255)}
+};
+
+void drawDrawingUI(Mat& img) {
+    // Draw color palette
+    for (int i = 0; i < 9; i++) {
+        Point center(20 + i * 34, output_height - 30);
+        circle(img, center, 15, color_pages[color_page][i], -1);
+        if (current_color == color_pages[color_page][i]) {
+            circle(img, center, 17, Scalar(255, 255, 255), 2);
+        }
+    }
+    // Tool buttons (top bar)
+    for (int i = 0; i < 5; i++) {
+        Rect tool_btn(10 + i * 65, 10, 50, 30);
+        rectangle(img, tool_btn, current_tool == i ? Scalar(200, 200, 255) : Scalar(50, 50, 50), -1);
+        putText(img, (i == 4 ? "E" : to_string(i + 1)), Point(tool_btn.x + 15, tool_btn.y + 22), FONT_HERSHEY_SIMPLEX, 0.7, Scalar(255, 255, 255), 2);
+    }
+    // Eyedropper (left-bottom)
+    Rect eyedrop(10, output_height - 60, 30, 30);
+    rectangle(img, eyedrop, Scalar(0, 0, 0), -1);
+    putText(img, "I", Point(eyedrop.x + 7, eyedrop.y + 22), FONT_HERSHEY_SIMPLEX, 0.7, Scalar(255, 255, 255), 2);
+}
+
+void drawButtons(Mat& img) {
+    if (show_photo_button) {
+        photo_button_rect = Rect(img.cols / 2 - 40, img.rows - 115, 80, 80);
+        circle(img, Point(photo_button_rect.x + 40, photo_button_rect.y + 40), 30, Scalar(255, 255, 255), -1);
+    }
+    if (show_upload_button) {
+        upload_button_rect = Rect(20, img.rows - 100, 60, 60);
+        rectangle(img, upload_button_rect, Scalar(0, 0, 0), -1);
+    }
+}
+
+void drawCloseButton(Mat& img) {
+    close_button_rect = Rect(10, 10, 30, 30);
+    circle(img, Point(25, 25), 20, Scalar(0, 0, 0), -1);
+    line(img, Point(15, 15), Point(35, 35), Scalar(255, 255, 255), 2);
+    line(img, Point(15, 35), Point(35, 15), Scalar(255, 255, 255), 2);
+
+    draw_button_rect = Rect(img.cols - 50, 10, 30, 30);
+    circle(img, Point(draw_button_rect.x + 15, draw_button_rect.y + 15), 15, Scalar(0, 0, 0), -1);
+    putText(img, "D", Point(draw_button_rect.x + 5, draw_button_rect.y + 22), FONT_HERSHEY_SIMPLEX, 0.6, Scalar(255, 255, 255), 2);
+}
+
+bool isInsideRect(Point p, Rect r) {
+    return (p.x >= r.x && p.x <= r.x + r.width && p.y >= r.y && p.y <= r.y + r.height);
+}
+
+void drawOnImage(Mat& canvas, Point p1, Point p2) {
+    if (current_tool == 4) {
+        line(canvas, p1, p2, Scalar(255, 255, 255), 20);
+    }
+    else if (current_tool == 3) {
+        line(canvas, p1, p2, current_color, 10, LINE_AA);
+    }
+    else {
+        line(canvas, p1, p2, current_color, 4, LINE_AA);
+    }
+}
+
+void mouseHandler(int event, int x, int y, int flags, void*) {
+    Point p(x, y);
+
+    if (drawing_mode) {
+        if (event == EVENT_LBUTTONDOWN) {
+            // Check palette buttons
+            for (int i = 0; i < 9; i++) {
+                Point center(20 + i * 34, output_height - 30);
+                if (norm(p - center) < 15) {
+                    current_color = color_pages[color_page][i];
+                    return;
+                }
+            }
+            Rect eyedrop(10, output_height - 60, 30, 30);
+            if (isInsideRect(p, eyedrop)) {
+                if (p.y < drawing_layer.rows && p.x < drawing_layer.cols) {
+                    current_color = captured_image.at<Vec3b>(p);
+                }
+                return;
+            }
+            for (int i = 0; i < 5; i++) {
+                Rect tool_btn(10 + i * 65, 10, 50, 30);
+                if (isInsideRect(p, tool_btn)) {
+                    current_tool = i;
+                    return;
+                }
+            }
+            last_point = p;
+        }
+        else if (event == EVENT_MOUSEMOVE && (flags & EVENT_FLAG_LBUTTON)) {
+            if (last_point.x >= 0) {
+                drawOnImage(drawing_layer, last_point, p);
+                last_point = p;
+            }
+        }
+        else if (event == EVENT_LBUTTONUP) {
+            last_point = Point(-1, -1);
+        }
+        return;
+    }
+
+    if (!photo_taken && !input_mode) {
+        if (show_photo_button && isInsideRect(p, photo_button_rect)) {
+            captured_image = drawing_layer = frame.clone();
+            resize(captured_image, captured_image, Size(output_width, output_height));
+            captured_image.copyTo(drawing_layer);
+            original_image = captured_image.clone();
+            photo_taken = true;
+            show_photo_button = false;
+            show_upload_button = false;
+        }
+        else if (show_upload_button && isInsideRect(p, upload_button_rect)) {
+            input_mode = true;
+            destroyAllWindows();
+            string path;
+            cout << "請輸入圖片相對路徑：";
+            cin >> path;
+            Mat img = imread(path);
+            if (!img.empty()) {
+                resize(img, captured_image, Size(output_width, output_height));
+                drawing_layer = captured_image.clone();
+                original_image = captured_image.clone();
+                photo_taken = true;
+            }
+            show_photo_button = false;
+            show_upload_button = false;
+        }
+    }
+    else if (photo_taken) {
+        if (isInsideRect(p, close_button_rect)) {
+            photo_taken = false;
+            drawing_mode = false;
+            filter_mode = 0;
+            captured_image.release();
+            original_image.release();
+            show_photo_button = true;
+            show_upload_button = true;
+        }
+        else if (isInsideRect(p, draw_button_rect)) {
+            drawing_mode = !drawing_mode;
+        }
+    }
+}
+
+int main() {
+    VideoCapture cap(0);
+    if (!cap.isOpened()) {
+        cerr << "無法開啟攝影機！\n";
+        return -1;
+    }
+
+    namedWindow("IG Camera", WINDOW_AUTOSIZE);
+    setMouseCallback("IG Camera", mouseHandler);
+
+    while (true) {
+        if (!photo_taken && !input_mode) {
+            cap >> frame;
+            if (frame.empty()) break;
+            Mat display;
+            resize(frame, display, Size(output_width, output_height));
+            drawButtons(display);
+            imshow("IG Camera", display);
+        }
+        else if (photo_taken) {
+            Mat display = drawing_layer.clone();
+            drawCloseButton(display);
+            if (drawing_mode) drawDrawingUI(display);
+            imshow("IG Camera", display);
+        }
+
+        char key = waitKey(30);
+        if (key == 27) break;
+        else if (key == 's') {
+            if (!captured_image.empty()) {
+                imwrite("saved_image.jpg", drawing_layer);
+                cout << "圖片已儲存為 saved_image.jpg\n";
+            }
+        }
+        else if (key == 81) { // left arrow
+            color_page = (color_page - 1 + 4) % 4;
+        }
+        else if (key == 83) { // right arrow
+            color_page = (color_page + 1) % 4;
+        }
+    }
+
+    cap.release();
+    destroyAllWindows();
+    return 0;
+}
