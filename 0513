@@ -102,9 +102,9 @@ void drawButtons(Mat& img) {
 
 void drawCloseButton(Mat& img) {
     close_button_rect = Rect(10, 10, 30, 30);
-    circle(img, Point(25, 25), 20, Scalar(0, 0, 0), -1);
-    line(img, Point(15, 15), Point(35, 35), Scalar(255, 255, 255), 2);
-    line(img, Point(15, 35), Point(35, 15), Scalar(255, 255, 255), 2);
+    circle(img, Point(25, 25), 15, Scalar(50, 50, 50), -1);
+    line(img, Point(17, 17), Point(32, 32), Scalar(255, 255, 255), 2);
+    line(img, Point(17, 32), Point(32, 17), Scalar(255, 255, 255), 2);
 }
 
 bool isInsideRect(Point p, Rect r) {
