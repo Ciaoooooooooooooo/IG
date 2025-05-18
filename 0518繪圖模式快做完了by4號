@@ -1,4 +1,4 @@
-#include <opencv2/opencv.hpp>
+#include <opencv2/opencv.hpp> 
 #include <iostream>
 #include <vector>
 #include <string>
@@ -14,6 +14,7 @@ bool eyedropper_active = false;
 
 Mat frame, captured_image, original_image;
 Mat drawing_layer;              // ★★★ 4-channel 透明畫布
+Mat filtered_image;
 
 Rect photo_button_rect, upload_button_rect, close_button_rect, draw_button_rect;
 bool show_photo_button = true, show_upload_button = true;
@@ -29,8 +30,13 @@ int thresh_value = 127;
 
 // 畫筆狀態
 Point  last_point(-1, -1);
+Point  arrow_start(-1, -1);      // 只給箭頭用
+vector<Point> arrow_path;
+
 Scalar current_color = Scalar(0, 0, 255);   // BGR (紅)
 int    current_tool = 0;                 // 0筆 1箭頭 2標記 3螢光 4橡皮
+enum Tool { PEN = 0, ARROW = 1, MARKER = 2, HIGHLIGHT = 3, ERASER = 4 };
+
 int    color_page = 0;
 vector<vector<Scalar>> color_pages = {
     {Scalar(0,0,0), Scalar(255,255,255), Scalar(255,0,0), Scalar(0,255,0), Scalar(0,0,255),
@@ -198,22 +204,75 @@ void blendLayers(const Mat& base_bgr, const Mat& layer_bgra, Mat& out_bgr)
     merge(out_ch, out_bgr);
 }
 
+static vector<Point> marker_strip;
 
-void drawOnLayer(Point p1, Point p2)      // ★★★
+void drawOnLayer(Point p1, Point p2)
 {
-    if (current_tool == 4)                 // 橡皮擦 → 畫透明線
-    {
+    // ── 4. 橡皮擦：透明 ─────────────────────────────
+    if (current_tool == ERASER) {
         line(drawing_layer, p1, p2, Scalar(0, 0, 0, 0), 25, LINE_AA);
         return;
     }
 
-    // 先決定顏色 + Alpha
-    Scalar col(current_color[0], current_color[1], current_color[2],
-        current_tool == 3 ? 150 : 255);   // 螢光筆半透明
-    int thickness = (current_tool == 3 ? 12 : 5);
+    // ── 1. 一般筆 ───────────────────────────────
+    if (current_tool == PEN) {
+        line(drawing_layer, p1, p2,
+            Scalar(current_color[0], current_color[1], current_color[2], 255),
+            5, LINE_AA);
+        return;
+    }
 
-    line(drawing_layer, p1, p2, col, thickness, LINE_AA);
+    // ── 2. 麥克筆 (透明度較低 + 平行四邊形筆跡) ─────
+    if (current_tool == MARKER) {
+        // 方向向量
+        Point2f v = p2 - p1;
+        float len = norm(v);
+        if (len < 1) return;
+        v /= len;                    // 單位向量
+        Point2f n(-v.y, v.x);        // 法向量，做筆觸寬度
+
+        const int half = 6;          // 12px 粗
+
+        // 先變成 Point2f 相加減
+        Point2f p1f(p1), p2f(p2);
+        Point2f nHalf = n * half;
+
+        Point2f pts_f[4] = {
+            p1f + nHalf,
+            p1f - nHalf,
+            p2f - nHalf,
+            p2f + nHalf
+        };
+
+        // 再轉回 Point（四捨五入到整數）
+        Point pts[4];
+        for (int i = 0; i < 4; ++i)
+            pts[i] = Point(cvRound(pts_f[i].x), cvRound(pts_f[i].y));
+        Scalar col(current_color[0], current_color[1], current_color[2], 120);
+        fillConvexPoly(drawing_layer, pts, 4, col, LINE_AA);
+
+
+        return;
+    }
+
+    // ── 3. 螢光筆 (白色實心 + 彩色外光) ─────────────
+    if (current_tool == HIGHLIGHT) {
+
+
+        // 外層彩色半透明包覆
+        line(drawing_layer, p1, p2,
+            Scalar(current_color[0], current_color[1], current_color[2], 120),
+            14, LINE_AA);
+
+        // 白線
+        line(drawing_layer, p1, p2,
+            Scalar(255, 255, 255, 255),    // 不透明白
+            6, LINE_AA);
+
+        return;
+    }
 }
+
 
 bool isInsideRect(Point p, Rect r) {
     return (p.x >= r.x && p.x <= r.x + r.width && p.y >= r.y && p.y <= r.y + r.height);
@@ -324,17 +383,72 @@ void mouseHandler(int event, int x, int y, int flags, void*) {
                 }
             }
 
+            if (current_tool == ARROW) {
+                arrow_path.clear();
+                arrow_path.push_back(p);      // 起始點
+            }         // 記下箭頭起點
             last_point = p;
         }
         else if (event == EVENT_MOUSEMOVE && (flags & EVENT_FLAG_LBUTTON)) {
-            if (last_point.x >= 0) {
+            if (current_tool == ARROW)
+            {
+                // ① 立即把上一點 → 目前點 畫出來
+                if (!arrow_path.empty())
+                    line(drawing_layer,
+                        arrow_path.back(),   // 上一點
+                        p,                   // 目前滑鼠
+                        Scalar(current_color[0], current_color[1], current_color[2], 255),
+                        5, LINE_AA);
+
+                // ② 再把當前點 push 進路徑
+                arrow_path.push_back(p);
+            }
+            else if (last_point.x >= 0)       // 其他工具維持原本
+            {
                 drawOnLayer(last_point, p);
                 last_point = p;
             }
         }
-        else if (event == EVENT_LBUTTONUP) {
+        // --- EVENT_LBUTTONUP 區段：使用 arrow_start 畫整支箭 ---
+
+        else if (event == EVENT_LBUTTONUP)
+        {
+            if (current_tool == MARKER) marker_strip.clear();
+
+            if (current_tool == ARROW && arrow_path.size() >= 2)
+            {
+                Scalar color(current_color[0], current_color[1], current_color[2], 255);
+
+                /* 2-1 畫彎曲主幹 */
+                for (size_t i = 1; i < arrow_path.size(); ++i)
+                    line(drawing_layer, arrow_path[i - 1], arrow_path[i], color, 5, LINE_AA);
+
+                /* 2-2 箭頭頭 */
+                Point Pn = arrow_path.back();          // 終點
+                Point Pn1 = arrow_path[arrow_path.size() - 10]; // 倒數第二點
+
+                Point2f v = Point2f(Pn1 - Pn);         // 方向
+                double vlen = norm(v);
+                if (vlen < 1e-3) v = Point2f(-1, 0);        // 避免零長
+                else           v *= (25.0 / vlen);        // 調長度
+
+                const double theta = CV_PI / 9;           // 20°
+                auto rot = [&](double a) {
+                    return Point(cvRound(Pn.x + (v.x * cos(a) - v.y * sin(a))),
+                        cvRound(Pn.y + (v.x * sin(a) + v.y * cos(a))));
+                    };
+                Point p1 = rot(+theta), p2 = rot(-theta);
+                line(drawing_layer, Pn, p1, color, 5, LINE_AA);
+                line(drawing_layer, Pn, p2, color, 5, LINE_AA);
+            }
+
+            /* reset */
+            arrow_path.clear();
             last_point = Point(-1, -1);
         }
+
+
+
         return;
     }
 
@@ -425,11 +539,9 @@ int main() {
             imshow("IG Camera", blank);
         }
         else if (photo_taken) {
-            Mat base;
-            if (drawing_mode)
-                base = captured_image.clone();          // 編輯底圖
-            else
-                applyFilter(captured_image, base);      // 濾鏡底圖
+            applyFilter(captured_image, filtered_image);        // 把目前底圖做濾鏡 → filtered_image
+            Mat base = drawing_mode ? captured_image            // 如果在畫圖，用未套濾鏡的底圖
+                : filtered_image;           // 否則顯示濾鏡結果
 
             Mat display;
             blendLayers(base, drawing_layer, display);  // ★★★ 套上筆跡
@@ -469,19 +581,23 @@ int main() {
         }
         else if (key == 'r') {
             if (!original_image.empty()) {
-                captured_image = original_image.clone();
+                captured_image = original_image.clone();   // 還原底圖
+                filtered_image = original_image.clone();   // 同步濾鏡來源
+                drawing_layer = Mat::zeros(output_height, output_width, CV_8UC4); // *** 清筆跡
                 filter_mode = 0;
                 resetWindow();
             }
         }
+
         else if (key == 's') {
-            if (!captured_image.empty()) {
-                Mat merged;
-                blendLayers(captured_image, drawing_layer, merged);
-                imwrite("saved_image.jpg", merged);
-                cout << "已存檔 saved_image.jpg\n";
-            }
+            if (!photo_taken) continue;
+            Mat base = drawing_mode ? captured_image : filtered_image;
+            Mat merged;  // 濾鏡 + 筆跡
+            blendLayers(base, drawing_layer, merged);
+            imwrite("saved_image.jpg", merged);
+            cout << "已存檔 saved_image.jpg\n";
         }
+
         else if (key == 97) { // left arrow
             color_page = (color_page - 1 + 4) % 4;
         }
@@ -489,6 +605,7 @@ int main() {
             color_page = (color_page + 1) % 4;
         }
     }
+
 
     cap.release();
     destroyAllWindows();
