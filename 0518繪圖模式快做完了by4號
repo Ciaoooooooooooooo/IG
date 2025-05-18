@@ -222,35 +222,11 @@ void drawOnLayer(Point p1, Point p2)
         return;
     }
 
-    // ── 2. 麥克筆 (透明度較低 + 平行四邊形筆跡) ─────
+    // ── 2. 麥克筆 (透明度較低 + 筆跡較大) ─────
     if (current_tool == MARKER) {
-        // 方向向量
-        Point2f v = p2 - p1;
-        float len = norm(v);
-        if (len < 1) return;
-        v /= len;                    // 單位向量
-        Point2f n(-v.y, v.x);        // 法向量，做筆觸寬度
-
-        const int half = 6;          // 12px 粗
-
-        // 先變成 Point2f 相加減
-        Point2f p1f(p1), p2f(p2);
-        Point2f nHalf = n * half;
-
-        Point2f pts_f[4] = {
-            p1f + nHalf,
-            p1f - nHalf,
-            p2f - nHalf,
-            p2f + nHalf
-        };
-
-        // 再轉回 Point（四捨五入到整數）
-        Point pts[4];
-        for (int i = 0; i < 4; ++i)
-            pts[i] = Point(cvRound(pts_f[i].x), cvRound(pts_f[i].y));
-        Scalar col(current_color[0], current_color[1], current_color[2], 120);
-        fillConvexPoly(drawing_layer, pts, 4, col, LINE_AA);
-
+ line(drawing_layer, p1, p2,
+            Scalar(current_color[0], current_color[1], current_color[2], 120),
+            12, LINE_AA);
 
         return;
     }
