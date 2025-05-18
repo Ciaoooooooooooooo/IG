@@ -226,7 +226,7 @@ Mat resizeAndFitImage(Mat& img) {
     Mat result(output_height, output_width, CV_8UC3);
     Mat resized;
 
-    if (input_aspect > target_aspect) {
+    if (img.cols >= img.rows) {
         // 橫式圖：上下有空白，製作漸層背景
         int new_width = output_width;
         int new_height = (int)(output_width / input_aspect);
@@ -251,11 +251,25 @@ Mat resizeAndFitImage(Mat& img) {
         int y_offset = (output_height - new_height) / 2;
         resized.copyTo(result(Rect(0, y_offset, new_width, new_height)));
     }
-    else {
-        // 直式圖：直接縮放填滿
-        resize(img, resized, Size(output_width, output_height));
-        result = resized;
+    else
+    {
+        // ── 1. 等比例縮放到「至少」覆蓋 324×576 ─────────────
+        double scale_w = static_cast<double>(output_width) / img.cols;   // 貼滿寬需要的倍率
+        double scale_h = static_cast<double>(output_height) / img.rows;   // 貼滿高需要的倍率
+        double scale = max(scale_w, scale_h);   // 取較大 => 一定能蓋滿兩邊
+
+        Size scaledSize(cvRound(img.cols * scale),
+            cvRound(img.rows * scale));
+        resize(img, resized, scaledSize);
+
+        // ── 2. 置中裁切到精確 324×576 ─────────────────────
+        int x_off = (resized.cols - output_width) / 2;
+        int y_off = (resized.rows - output_height) / 2;
+        Rect roi(x_off, y_off, output_width, output_height);
+
+        result = resized(roi).clone();   // 裁切後貼回 result
     }
+
 
     return result;
 }
