@@ -1,0 +1,952 @@
+#include <opencv2/opencv.hpp>
+#include <iostream>
+#include <vector>
+#include <string>
+#include <cstdlib>
+
+using namespace cv;
+using namespace std;
+
+// -------------------- 全域旗標與變數 (IG Camera) --------------------
+bool photo_taken = false;
+bool input_mode = false;
+bool drawing_mode = false;
+bool eyedropper_active = false;
+
+Mat frame, captured_image, original_image;
+Mat drawing_layer;         // ★★★ 4-channel 透明畫布
+Mat filtered_image;
+
+Rect photo_button_rect, upload_button_rect, close_button_rect, draw_button_rect;
+bool show_photo_button = true, show_upload_button = true;
+bool show_draw_button = true;
+Rect addtext_button_rect;              // A 按鈕外框
+bool show_addtext_button = true;       // 是否顯示
+bool text_mode = false; // ★ 目前是否停留在「文字功能」畫面
+
+
+const int output_width = 324;
+const int output_height = 576;    // 9:16
+
+int filter_mode = 0;
+int brightness = 0;
+int contrast = 100;
+int thresh_value = 127;
+
+// 畫筆狀態
+Point  last_point(-1, -1);
+Point  arrow_start(-1, -1);      // 只給箭頭用
+vector<Point> arrow_path;
+
+Scalar current_color = Scalar(0, 0, 255);    // BGR (紅)
+int    current_tool = 0;              // 0筆 1箭頭 2標記 3螢光 4橡皮
+enum Tool { PEN = 0, ARROW = 1, MARKER = 2, HIGHLIGHT = 3, ERASER = 4 };
+
+int    color_page = 0;
+vector<vector<Scalar>> color_pages = {
+    {Scalar(0,0,0), Scalar(255,255,255), Scalar(255,0,0), Scalar(0,255,0), Scalar(0,0,255),
+     Scalar(255,255,0), Scalar(255,0,255), Scalar(0,255,255), Scalar(128,128,128)},
+    {Scalar(0,128,0), Scalar(128,0,0), Scalar(0,0,128), Scalar(128,128,0), Scalar(128,0,128),
+     Scalar(0,128,128), Scalar(192,192,192), Scalar(64,64,64), Scalar(255,128,0)},
+    {Scalar(255,153,204), Scalar(204,255,153), Scalar(153,204,255), Scalar(255,204,153),
+     Scalar(153,255,204), Scalar(204,153,255), Scalar(255,255,204), Scalar(204,255,255),
+     Scalar(255,204,204)},
+    {Scalar(51,0,51), Scalar(102,0,102), Scalar(153,0,153), Scalar(204,0,204), Scalar(255,0,255),
+     Scalar(255,51,255), Scalar(255,102,255), Scalar(255,153,255), Scalar(255,204,255)}
+};
+
+// -------------------- 全域變數 (Text Editor) --------------------
+struct TextBox {
+    string text;
+    Point pos;
+    int fontSize;
+    int align; // 0: left, 1: center, 2: right
+};
+
+vector<TextBox> textBoxes;
+int selectedIndex = -1;
+
+bool editing = false;  // 是否正在編輯文字框
+
+// 拖曳相關狀態
+bool isDragging = false;
+bool clickInsideText = false;
+Point dragOffset;
+Point dragStartPos;
+
+int fontFace = FONT_HERSHEY_SIMPLEX;
+
+// 按鈕參數
+struct Button {
+    Rect rect;
+    string label;
+};
+vector<Button> buttons;
+
+bool fontSizeTrackbarCreated = false; // 追蹤字體大小追蹤條是否已創建
+
+// -------------------- Text Editor 功能 --------------------
+// 判斷滑鼠是否在按鈕上
+int hitButton(Point pt) {
+    for (int i = 0; i < (int)buttons.size(); i++) {
+        if (buttons[i].rect.contains(pt)) return i;
+    }
+    return -1;
+}
+
+// 依字串換行拆成vector<string>
+vector<string> splitLines(const string& str) {
+    vector<string> lines;
+    size_t start = 0;
+    while (true) {
+        size_t pos = str.find('\n', start);
+        if (pos == string::npos) {
+            lines.push_back(str.substr(start));
+            break;
+        }
+        lines.push_back(str.substr(start, pos - start));
+        start = pos + 1;
+    }
+    return lines;
+}
+
+void drawTextBoxes(Mat& img) {
+    //先畫按鈕
+    for (auto& btn : buttons) {
+        rectangle(img, btn.rect, Scalar(220, 220, 220), FILLED);
+        rectangle(img, btn.rect, Scalar(100, 100, 100), 1);
+        int baseline = 0;
+        Size textSize = getTextSize(btn.label, fontFace, 0.6, 1, &baseline);
+        Point textOrg(
+            btn.rect.x + (btn.rect.width - textSize.width) / 2,
+            btn.rect.y + (btn.rect.height + textSize.height) / 2 - 2
+        );
+        putText(img, btn.label, textOrg, fontFace, 0.6, Scalar(0, 0, 0), 1);
+    }
+
+    //畫文字框
+    for (int i = 0; i < (int)textBoxes.size(); i++) {
+        auto& tb = textBoxes[i];
+
+        int fontScale = tb.fontSize;
+        int thickness = max(1, fontScale / 5);
+
+        vector<string> lines = splitLines(tb.text);
+
+        // 計算整體高度（多行高度疊加）
+        int totalHeight = 0;
+        vector<Size> lineSizes;
+        vector<int> baselines;
+        for (auto& line : lines) {
+            int baseline = 0;
+            int fontScale = max(1, tb.fontSize);   // ★ 加這行，把 0 提成 1
+
+            Size sz = getTextSize(line, fontFace, fontScale / 10.0, thickness, &baseline);
+            lineSizes.push_back(sz);
+            baselines.push_back(baseline);
+            totalHeight += sz.height + baseline;
+        }
+
+        int yStart = tb.pos.y - totalHeight; // 從pos.y往上排多行文字
+
+        // 一行行畫
+        int y = yStart;
+        for (size_t j = 0; j < lines.size(); j++) {
+            int x = tb.pos.x;
+            if (tb.align == 1) // center
+                x = tb.pos.x - lineSizes[j].width / 2;
+            else if (tb.align == 2) // right
+                x = tb.pos.x - lineSizes[j].width;
+
+            Point textOrg(x, y + lineSizes[j].height);
+            int fontScale = max(1, tb.fontSize);   // ★ 加這行，把 0 提成 1
+
+            putText(img, lines[j], textOrg, fontFace, fontScale / 10.0, Scalar(0, 0, 0), thickness);
+
+            // 如果是被選中且最後一行且正在編輯，畫光標
+            if (i == selectedIndex && editing && j == lines.size() - 1) {
+                int cursorX = textOrg.x + lineSizes[j].width + 2;
+                int cursorY1 = textOrg.y - lineSizes[j].height;
+                int cursorY2 = textOrg.y + baselines[j];
+                line(img, Point(cursorX, cursorY1), Point(cursorX, cursorY2), Scalar(0, 0, 255), 1);
+            }
+
+            y += lineSizes[j].height + baselines[j];
+        }
+
+        // 畫選中框 (包覆全部文字區域)
+        if (i == selectedIndex) {
+            int maxWidth = 0;
+            for (auto& sz : lineSizes) if (sz.width > maxWidth) maxWidth = sz.width;
+
+            int left = tb.pos.x;
+            int right = tb.pos.x;
+
+            if (tb.align == 1) { // center
+                left = tb.pos.x - maxWidth / 2;
+                right = tb.pos.x + maxWidth / 2;
+            }
+            else if (tb.align == 2) { // right
+                left = tb.pos.x - maxWidth;
+                right = tb.pos.x;
+            }
+            else { // left
+                right = tb.pos.x + maxWidth;
+            }
+
+            int top = yStart;
+            int bottom = yStart + totalHeight;
+            rectangle(img, Point(left, top), Point(right, bottom), Scalar(255, 0, 0), 1);
+        }
+    }
+}
+
+// -------------------- IG Camera 功能 --------------------
+void drawDrawingUI(Mat& img) {
+    // Draw color palette
+    for (int i = 0; i < 9; i++) {
+        Point center(60 + i * 30, output_height - 30);
+        circle(img, center, 11, color_pages[color_page][i], -1);
+        if (current_color == color_pages[color_page][i]) {
+            circle(img, center, 13, Scalar(255, 255, 255), 2);
+        }
+    }
+    // Tool buttons (top bar)
+    for (int i = 0; i < 5; i++) {
+        Rect tool_btn(60 + i * 43, 10, 30, 30);
+        rectangle(img, tool_btn, current_tool == i ? Scalar(200, 200, 255) : Scalar(50, 50, 50), -1);
+        putText(img, (i == 4 ? "E" : to_string(i + 1)), Point(tool_btn.x + 7, tool_btn.y + 22), FONT_HERSHEY_SIMPLEX, 0.7, Scalar(255, 255, 255), 2);
+    }
+    // Eyedropper (left-bottom)
+    Rect eyedrop(10, output_height - 45, 30, 30);
+    rectangle(img, eyedrop, Scalar(0, 0, 0), -1);
+    putText(img, "I", Point(eyedrop.x + 10, eyedrop.y + 22), FONT_HERSHEY_SIMPLEX, 0.7, Scalar(255, 255, 255), 2);
+}
+
+void applyFilter(Mat src, Mat& dst) {
+    if (filter_mode == 1) {
+        src.convertTo(dst, -1, 1, brightness);
+    }
+    else if (filter_mode == 2) {
+        float alpha = contrast / 100.0f;
+        src.convertTo(dst, -1, alpha, 0);
+    }
+    else if (filter_mode == 3) {
+        bitwise_not(src, dst);
+    }
+    else if (filter_mode == 4) {
+        Mat gray;
+        cvtColor(src, gray, COLOR_BGR2GRAY);
+        threshold(gray, dst, thresh_value, 255, THRESH_BINARY);
+        cvtColor(dst, dst, COLOR_GRAY2BGR);
+    }
+    else if (filter_mode == 5) {
+        Mat gray, binary;
+        cvtColor(src, gray, COLOR_BGR2GRAY);
+        threshold(gray, binary, thresh_value, 255, THRESH_BINARY);
+
+        Mat gradient_white(output_height, output_width, CV_8UC3);
+        Mat gradient_black(output_height, output_width, CV_8UC3);
+
+        for (int y = 0; y < output_height; y++) {
+            float alpha = (float)y / output_height;
+            Vec3b color_w = alpha * Vec3b(0, 100, 1) + (1 - alpha) * Vec3b(0, 255, 255);
+            Vec3b color_b = alpha * Vec3b(100, 100, 0) + (1 - alpha) * Vec3b(255, 255, 0);
+            for (int x = 0; x < output_width; x++) {
+                gradient_white.at<Vec3b>(y, x) = color_w;
+                gradient_black.at<Vec3b>(y, x) = color_b;
+            }
+        }
+
+        dst = Mat::zeros(src.size(), src.type());
+        gradient_white.copyTo(dst, binary);
+        gradient_black.copyTo(dst, 255 - binary);
+    }
+    else {
+        dst = src.clone();
+    }
+}
+
+Rect getCentralCropRect(Size originalSize) {
+    float input_aspect = (float)originalSize.width / originalSize.height;
+    float target_aspect = 9.0f / 16.0f;
+
+    int new_width = originalSize.width;
+    int new_height = originalSize.height;
+
+    if (input_aspect > target_aspect) {
+        new_width = int(originalSize.height * target_aspect);
+    }
+    else {
+        new_height = int(originalSize.width / target_aspect);
+    }
+
+    int x = (originalSize.width - new_width) / 2;
+    int y = (originalSize.height - new_height) / 2;
+
+    return Rect(x, y, new_width, new_height);
+}
+
+Mat cropTo916(Mat& img) {
+    Rect crop = getCentralCropRect(img.size());
+    Mat cropped = img(crop).clone();
+    resize(cropped, cropped, Size(output_width, output_height));
+    return cropped;
+}
+
+void drawButtons(Mat& img) {
+    if (show_photo_button) {
+        photo_button_rect = Rect(img.cols / 2 - 40, img.rows - 115, 80, 80);
+        circle(img, Point(photo_button_rect.x + 40, photo_button_rect.y + 40), 30, Scalar(255, 255, 255), -1);
+    }
+    if (show_upload_button) {
+        upload_button_rect = Rect(20, img.rows - 100, 60, 60);
+        rectangle(img, upload_button_rect, Scalar(0, 0, 0), -1);
+    }
+}
+
+void drawCloseButton(Mat& img) {
+    close_button_rect = Rect(10, 10, 30, 30);
+    circle(img, Point(25, 25), 20, Scalar(0, 0, 0), -1);
+    line(img, Point(15, 15), Point(35, 35), Scalar(255, 255, 255), 2);
+    line(img, Point(15, 35), Point(35, 15), Scalar(255, 255, 255), 2);
+
+    if (show_draw_button) {
+        draw_button_rect = Rect(img.cols - 50, 10, 30, 30);
+        circle(img, Point(draw_button_rect.x + 15, draw_button_rect.y + 15),
+            15, Scalar(0, 0, 0), -1);
+        putText(img, "D", Point(draw_button_rect.x + 9, draw_button_rect.y + 22),
+            FONT_HERSHEY_SIMPLEX, 0.6, Scalar(255, 255, 255), 2);
+    }
+    if (show_addtext_button) {
+        addtext_button_rect = Rect(img.cols - 100, 10, 30, 30);          // ← D 右邊
+        circle(img, Point(addtext_button_rect.x + 15, addtext_button_rect.y + 15),
+            15, Scalar(0, 0, 0), -1);
+        putText(img, "A", Point(addtext_button_rect.x + 9, addtext_button_rect.y + 22),
+            FONT_HERSHEY_SIMPLEX, 0.6, Scalar(255, 255, 255), 2);
+    }
+}
+void blendLayers(const Mat& base_bgr, const Mat& layer_bgra, Mat& out_bgr)
+{
+    CV_Assert(layer_bgra.type() == CV_8UC4);
+    CV_Assert(base_bgr.type() == CV_8UC3);
+    CV_Assert(base_bgr.size() == layer_bgra.size());
+
+    // 1) 先把 α 通道轉為 0~1 的 32F
+    Mat alpha_f;
+    {
+        vector<Mat> layer_ch;
+        split(layer_bgra, layer_ch);         // B G R A
+        layer_ch[3].convertTo(alpha_f, CV_32F, 1.0 / 255.0);
+    }
+
+    // 2) 拆 base 與 layer 的 BGR，全部轉 float
+    vector<Mat> base_ch_f(3), layer_ch_f(3);
+    {
+        vector<Mat> tmp;
+        split(base_bgr, tmp);
+        for (int i = 0; i < 3; i++) tmp[i].convertTo(base_ch_f[i], CV_32F);
+
+        split(layer_bgra, tmp);             // 再 split 一次拿 BGR
+        for (int i = 0; i < 3; i++) tmp[i].convertTo(layer_ch_f[i], CV_32F);
+    }
+
+    // 3) 混色： dst = L*α + B*(1-α)
+    vector<Mat> out_ch(3);
+    for (int i = 0; i < 3; i++)
+    {
+        out_ch[i] = layer_ch_f[i].mul(alpha_f) + base_ch_f[i].mul(1.0f - alpha_f);
+        out_ch[i].convertTo(out_ch[i], CV_8U);
+    }
+
+    // 4) 合併回 BGR
+    merge(out_ch, out_bgr);
+}
+
+static vector<Point> marker_strip;
+
+void drawOnLayer(Point p1, Point p2)
+{
+    // ── 4. 橡皮擦：透明 ─────────────────────────────
+    if (current_tool == ERASER) {
+        line(drawing_layer, p1, p2, Scalar(0, 0, 0, 0), 25, LINE_AA);
+        return;
+    }
+
+    // ── 1. 一般筆 ───────────────────────────────
+    if (current_tool == PEN) {
+        line(drawing_layer, p1, p2,
+            Scalar(current_color[0], current_color[1], current_color[2], 255),
+            5, LINE_AA);
+        return;
+    }
+
+    // ── 2. 麥克筆 (透明度較低 + 筆跡較大) ─────
+    if (current_tool == MARKER) {
+        line(drawing_layer, p1, p2,
+            Scalar(current_color[0], current_color[1], current_color[2], 120),
+            12, LINE_AA);
+
+        return;
+    }
+
+    // ── 3. 螢光筆 (白色實心 + 彩色外光) ─────────────
+    if (current_tool == HIGHLIGHT) {
+
+
+        // 外層彩色半透明包覆
+        line(drawing_layer, p1, p2,
+            Scalar(current_color[0], current_color[1], current_color[2], 120),
+            14, LINE_AA);
+
+        // 白線
+        line(drawing_layer, p1, p2,
+            Scalar(255, 255, 255, 255),      // 不透明白
+            6, LINE_AA);
+
+        return;
+    }
+}
+
+
+bool isInsideRect(Point p, Rect r) {
+    return (p.x >= r.x && p.x <= r.x + r.width && p.y >= r.y && p.y <= r.y + r.height);
+}
+
+Mat resizeAndFitImage(Mat& img) {
+    float input_aspect = (float)img.cols / img.rows;
+    float target_aspect = 9.0f / 16.0f;
+
+    Mat result(output_height, output_width, CV_8UC3);
+    Mat resized;
+
+    if (img.cols >= img.rows) {
+        // 橫式圖：上下有空白，製作漸層背景
+        int new_width = output_width;
+        int new_height = (int)(output_width / input_aspect);
+        resize(img, resized, Size(new_width, new_height));
+
+        // 從圖片上方與下方各取一行作為漸層顏色基底
+        Vec3b top_color = resized.at<Vec3b>(0, new_width / 2);
+        Vec3b bottom_color = resized.at<Vec3b>(resized.rows - 1, new_width / 2);
+
+        for (int y = 0; y < output_height; y++) {
+            float alpha = (float)y / output_height;
+            Vec3b color;
+            for (int c = 0; c < 3; c++) {
+                color[c] = (uchar)((1 - alpha) * top_color[c] + alpha * bottom_color[c]);
+            }
+            for (int x = 0; x < output_width; x++) {
+                result.at<Vec3b>(y, x) = color;
+            }
+        }
+
+        // 把縮放後圖片貼在中間
+        int y_offset = (output_height - new_height) / 2;
+        resized.copyTo(result(Rect(0, y_offset, new_width, new_height)));
+    }
+    else
+    {
+        // ── 1. 等比例縮放到「至少」覆蓋 324×576 ─────────────
+        double scale_w = static_cast<double>(output_width) / img.cols;    // 貼滿寬需要的倍率
+        double scale_h = static_cast<double>(output_height) / img.rows;    // 貼滿高需要的倍率
+        double scale = max(scale_w, scale_h);    // 取較大 => 一定能蓋滿兩邊
+
+        Size scaledSize(cvRound(img.cols * scale),
+            cvRound(img.rows * scale));
+        resize(img, resized, scaledSize);
+
+        // ── 2. 置中裁切到精確 324×576 ─────────────────────
+        int x_off = (resized.cols - output_width) / 2;
+        int y_off = (resized.rows - output_height) / 2;
+        Rect roi(x_off, y_off, output_width, output_height);
+
+        result = resized(roi).clone();    // 裁切後貼回 result
+    }
+
+
+    return result;
+}
+
+
+void resetWindow() {
+    destroyWindow("IG Camera");
+    namedWindow("IG Camera", WINDOW_AUTOSIZE);
+ 
+}
+
+
+void mouseHandler(int event, int x, int y, int flags, void*) {
+    Point pt(x, y);
+
+    // Text Editor Mouse Handling
+    int btnIdx = hitButton(pt);
+    if (event == EVENT_LBUTTONDOWN && btnIdx >= 0 && selectedIndex >= 0) {
+        textBoxes[selectedIndex].align = btnIdx; // 0:left,1:center,2:right
+        editing = false;
+        return;
+    }
+
+    if (event == EVENT_LBUTTONDOWN) {
+        clickInsideText = false;
+        for (int i = (int)textBoxes.size() - 1; i >= 0; i--) {
+            auto& tb = textBoxes[i];
+            int fontScale = tb.fontSize;
+            int thickness = max(1, fontScale / 5);
+
+            vector<string> lines = splitLines(tb.text);
+
+            int totalHeight = 0;
+            vector<Size> lineSizes;
+            vector<int> baselines;
+            for (auto& line : lines) {
+                int baseline = 0;
+                int fontScale = max(1, tb.fontSize);   // ★ 加這行，把 0 提成 1
+
+                Size sz = getTextSize(line, fontFace, fontScale / 10.0, thickness, &baseline);
+                lineSizes.push_back(sz);
+                baselines.push_back(baseline);
+                totalHeight += sz.height + baseline;
+            }
+            int yStart = tb.pos.y - totalHeight;
+
+            for (size_t j = 0; j < lines.size(); j++) {
+                int tx = tb.pos.x;
+                if (tb.align == 1)
+                    tx = tb.pos.x - lineSizes[j].width / 2;
+                else if (tb.align == 2)
+                    tx = tb.pos.x - lineSizes[j].width;
+
+                Rect rect(tx, yStart, lineSizes[j].width, lineSizes[j].height + baselines[j]);
+                if (rect.contains(pt)) {
+                    selectedIndex = i;
+                    dragOffset = Point(x - tb.pos.x, y - tb.pos.y);
+                    isDragging = false;
+                    clickInsideText = true;
+                    dragStartPos = pt;
+                    editing = false;
+                    break;
+                }
+                yStart += lineSizes[j].height + baselines[j];
+            }
+            if (clickInsideText) break;
+        }
+        if (!clickInsideText) {
+            selectedIndex = -1;
+            editing = false;
+        }
+    }
+    else if (event == EVENT_MOUSEMOVE) {
+        if (clickInsideText) {
+            if (!isDragging && (abs(x - dragStartPos.x) > 5 || abs(y - dragStartPos.y) > 5)) {
+                isDragging = true;
+                editing = false;
+            }
+            if (isDragging && selectedIndex >= 0) {
+                textBoxes[selectedIndex].pos = Point(x - dragOffset.x, y - dragOffset.y);
+            }
+        }
+    }
+    else if (event == EVENT_LBUTTONUP) {
+        if (clickInsideText && !isDragging && selectedIndex >= 0) {
+            editing = true;
+        }
+        isDragging = false;
+        clickInsideText = false;
+    }
+
+    // IG Camera Mouse Handling
+    if (drawing_mode) {
+        if (event == EVENT_LBUTTONDOWN) {
+            if (isInsideRect(pt, close_button_rect))
+            {
+                drawing_mode = false;
+                show_draw_button = true;
+                show_addtext_button = true;
+                return;
+            }
+
+            for (int i = 0; i < 9; i++) {
+                Point center(60 + i * 30, output_height - 30);
+                if (norm(pt - center) < 11) {
+                    current_color = color_pages[color_page][i];
+                    return;
+                }
+            }
+
+            Rect eyedrop(10, output_height - 45, 30, 30);
+            if (isInsideRect(pt, eyedrop)) {
+                eyedropper_active = true; // 啟動吸色模式
+                cout << "吸色模式啟動，請點擊圖片以吸取顏色。\n";
+                return;
+            }
+
+            if (eyedropper_active) {
+                if (pt.y < captured_image.rows && pt.x < captured_image.cols) {
+                    current_color = captured_image.at<Vec3b>(pt);
+                    eyedropper_active = false;
+                    cout << "已吸取顏色：" << current_color << endl;
+                }
+                else {
+                    cout << "超出圖片範圍，請重新點擊圖片內部。\n";
+                }
+                return;
+            }
+
+            for (int i = 0; i < 5; i++) {
+                Rect tool_btn(60 + i * 43, 10, 30, 30);
+                if (isInsideRect(pt, tool_btn)) {
+                    current_tool = i;
+                    return;
+                }
+            }
+
+            if (current_tool == ARROW) {
+                arrow_path.clear();
+                arrow_path.push_back(pt);     // 起始點
+            }         // 記下箭頭起點
+            last_point = pt;
+        }
+        else if (event == EVENT_MOUSEMOVE && (flags & EVENT_FLAG_LBUTTON)) {
+            if (current_tool == ARROW)
+            {//show_addtext_button
+                // ① 立即把上一點 → 目前點 畫出來
+                if (!arrow_path.empty())
+                    line(drawing_layer,
+                        arrow_path.back(),    // 上一點
+                        pt,                 // 目前滑鼠
+                        Scalar(current_color[0], current_color[1], current_color[2], 255),
+                        5, LINE_AA);
+
+                // ② 再把當前點 push 進路徑
+                arrow_path.push_back(pt);
+            }
+            else if (last_point.x >= 0)         // 其他工具維持原本
+            {
+                drawOnLayer(last_point, pt);
+                last_point = pt;
+            }
+        }
+        // --- EVENT_LBUTTONUP 區段：使用 arrow_start 畫整支箭 ---
+
+        else if (event == EVENT_LBUTTONUP)
+        {
+            if (current_tool == MARKER) marker_strip.clear();
+
+            if (current_tool == ARROW && arrow_path.size() >= 2)
+            {
+                Scalar color(current_color[0], current_color[1], current_color[2], 255);
+
+                /* 2-1 畫彎曲主幹 */
+                for (size_t i = 1; i < arrow_path.size(); ++i)
+                    line(drawing_layer, arrow_path[i - 1], arrow_path[i], color, 5, LINE_AA);
+
+                /* 2-2 箭頭頭 */ // 取箭頭方向用的上一點
+                size_t n = arrow_path.size();
+                Point Pn = arrow_path.back();                 // 終點
+                Point Pn1 = arrow_path[n >= 10 ? n - 10 : 0];    // 至少拿得到 1 個點
+
+
+                Point2f v = Point2f(Pn1 - Pn);         // 方向
+                double vlen = norm(v);
+                if (vlen < 1e-3) v = Point2f(-1, 0);         // 避免零長
+                else             v *= (25.0 / vlen);         // 調長度
+
+                const double theta = CV_PI / 9;             // 20°
+                auto rot = [&](double a) {
+                    return Point(cvRound(Pn.x + (v.x * cos(a) - v.y * sin(a))),
+                        cvRound(Pn.y + (v.x * sin(a) + v.y * cos(a))));
+                    };
+                Point p1 = rot(+theta), p2 = rot(-theta);
+                line(drawing_layer, Pn, p1, color, 5, LINE_AA);
+                line(drawing_layer, Pn, p2, color, 5, LINE_AA);
+            }
+
+            /* reset */
+            arrow_path.clear();
+            last_point = Point(-1, -1);
+        }
+
+        return;
+    }
+
+    // 拍照/上傳圖邏輯
+    if (!photo_taken && !input_mode) {
+        if (event == EVENT_LBUTTONDOWN && show_photo_button && isInsideRect(pt, photo_button_rect)) {
+            captured_image = cropTo916(frame);
+            original_image = captured_image.clone();
+            drawing_layer = Mat::zeros(output_height, output_width, CV_8UC4);
+            photo_taken = true;
+            show_photo_button = false;
+            show_upload_button = false;
+
+            // 初始化按鈕位置和標籤 (Text Editor)
+         
+        }
+        else if (event == EVENT_LBUTTONDOWN && show_upload_button && isInsideRect(pt, upload_button_rect)) {
+            input_mode = true;
+            string path;
+            cout << "請輸入圖片相對路徑：";
+            cin >> path;
+
+            Mat img = imread(path);
+            if (!img.empty()) {
+                captured_image = resizeAndFitImage(img);
+                original_image = captured_image.clone();
+                drawing_layer = Mat::zeros(output_height, output_width, CV_8UC4);
+                photo_taken = true;
+                show_photo_button = show_upload_button = false;
+
+                
+            }
+            else {
+                cout << "無法讀取圖片，請檢查路徑！\n";
+            }
+            input_mode = false;                 // ①-2 退出輸入模式
+        }
+    }
+    else if (photo_taken) {
+        if (event == EVENT_LBUTTONDOWN && isInsideRect(pt, close_button_rect)) {
+       
+            if (text_mode) {                 // ★ 只結束文字功能
+
+                text_mode = false;
+                editing = false;
+                selectedIndex = -1;
+                show_draw_button = true;
+                show_addtext_button = true;
+                buttons.clear();             // 收掉「左中右」對齊鈕
+                resetWindow();
+                fontSizeTrackbarCreated = false;
+                setMouseCallback("IG Camera", mouseHandler);
+                return;                      // ★ 直接回到濾鏡 / 調整畫面
+            }
+
+            photo_taken = false;
+            filter_mode = 0;
+            captured_image.release();
+            original_image.release();
+            drawing_layer.release();
+            textBoxes.clear();
+            selectedIndex = -1;
+            editing = false;
+            show_photo_button = true;
+            show_upload_button = true;
+            show_draw_button = true;
+            show_addtext_button = true;
+            buttons.clear();
+            fontSizeTrackbarCreated = false; // 重置追蹤條狀態
+            destroyWindow("IG Camera");
+            namedWindow("IG Camera", WINDOW_AUTOSIZE);
+            setMouseCallback("IG Camera", mouseHandler);
+        }
+        else if (event == EVENT_LBUTTONDOWN && show_draw_button &&
+            isInsideRect(pt, draw_button_rect))
+        {
+            drawing_mode = true;    // 進入繪圖
+            show_draw_button = false; // 把 D 隱藏
+            show_addtext_button = false;
+            
+
+        }
+        else if (event == EVENT_LBUTTONDOWN && show_addtext_button &&
+            isInsideRect(pt, addtext_button_rect))
+        {
+            show_draw_button = false;
+            // 1. 產生文字框
+            TextBox tb;
+            tb.text = "New text";
+            tb.pos = Point(rand() % (output_width - 100) + 50,
+                rand() % (output_height - 100) + 50);
+            tb.fontSize = 20;
+            tb.align = 0;
+            textBoxes.push_back(tb);
+            selectedIndex = static_cast<int>(textBoxes.size()) - 1;
+            editing = true;
+
+            // 2. 建立「左 / 中 / 右」三顆對齊鈕（此時才 push）
+            buttons.clear();
+            buttons.push_back(Button{ Rect(output_width - 180, 10, 50, 30), "R" });
+            buttons.push_back(Button{ Rect(output_width - 120, 10, 50, 30), "C" });
+            buttons.push_back(Button{ Rect(output_width - 60, 10, 50, 30), "L" });
+
+            // 3. 把 A 按鈕自己收起來，避免一直被點
+            show_addtext_button = false;
+            text_mode = true;  // ★ 進入文字模式
+            return;
+        }
+
+    }
+}
+
+
+
+//!img.empty
+void onBrightness(int pos, void*) { brightness = pos - 100; }
+void onContrast(int pos, void*) { contrast = pos; }
+void onThreshold(int pos, void*) { thresh_value = pos; }
+void onFontSize(int pos, void*) {
+    if (selectedIndex >= 0) {
+        textBoxes[selectedIndex].fontSize = pos;
+    }
+}
+
+
+int main() {
+    utils::logging::setLogLevel(utils::logging::LOG_LEVEL_ERROR);
+
+    VideoCapture cap(0);
+    if (!cap.isOpened()) {
+        cerr << "無法開啟攝影機！\n";
+        return -1;
+    }
+
+    namedWindow("IG Camera", WINDOW_AUTOSIZE);
+    setMouseCallback("IG Camera", mouseHandler);
+
+    while (true) {
+     
+                         
+          
+        if (!photo_taken && !input_mode) {
+            cap >> frame;
+            if (frame.empty()) break;
+            Mat display = cropTo916(frame);
+            drawButtons(display);
+            imshow("IG Camera", display);
+        }
+        else if (input_mode) {                // ★★★ 新增
+            Mat blank(output_height, output_width, CV_8UC3, Scalar(30, 30, 30));
+            putText(blank, "輸入路徑後按 Enter ...", Point(25, output_height / 2),
+                FONT_HERSHEY_SIMPLEX, 0.6, Scalar(200, 200, 200), 2);
+            imshow("IG Camera", blank);
+        }
+        else if (photo_taken) {
+            applyFilter(captured_image, filtered_image);        // 把目前底圖做濾鏡 → filtered_image
+            Mat base = drawing_mode ? captured_image         // 如果在畫圖，用未套濾鏡的底圖
+                : filtered_image;          // 否則顯示濾鏡結果
+
+            Mat display;
+            blendLayers(base, drawing_layer, display); // ★★★ 套上筆跡
+            drawTextBoxes(display);
+
+            drawCloseButton(display);
+            if (drawing_mode) drawDrawingUI(display);
+            imshow("IG Camera", display);
+        }
+
+        char key = waitKey(30);
+        if (key == 27) break;
+        else if (key == '1') {
+            filter_mode = 1;
+            resetWindow();
+            setMouseCallback("IG Camera", mouseHandler);
+            createTrackbar("亮度", "IG Camera", 0, 200, onBrightness);
+            setTrackbarPos("亮度", "IG Camera", 100);
+        }
+        else if (key == '2') {
+            filter_mode = 2;
+            resetWindow();
+            setMouseCallback("IG Camera", mouseHandler);
+            createTrackbar("對比度", "IG Camera", 0, 200, onContrast);
+            setTrackbarPos("對比度", "IG Camera", 100);
+        }
+        else if (key == '3') {
+            filter_mode = 3;
+            resetWindow();
+            setMouseCallback("IG Camera", mouseHandler);
+        }
+        else if (key == '4') {
+            filter_mode = 4;
+            resetWindow();
+            setMouseCallback("IG Camera", mouseHandler);
+            createTrackbar("二值化閾值", "IG Camera", &thresh_value, 255, onThreshold);
+        }
+        else if (key == '5') {
+            filter_mode = 5;
+            resetWindow();
+            setMouseCallback("IG Camera", mouseHandler);
+            createTrackbar("漸層閾值", "IG Camera", &thresh_value, 255, onThreshold);
+        }
+        else if (key == 'r') {
+            if (!original_image.empty()) {
+                captured_image = original_image.clone();    // 還原底圖
+                filtered_image = original_image.clone();    // 同步濾鏡來源
+                drawing_layer = Mat::zeros(output_height, output_width, CV_8UC4); // *** 清筆跡
+                textBoxes.clear();
+                selectedIndex = -1;
+                editing = false;
+                filter_mode = 0;
+                resetWindow();
+                setMouseCallback("IG Camera", mouseHandler);
+                fontSizeTrackbarCreated = false; // 重置追蹤條狀態
+    
+            }
+        }
+
+        else if (key == 's') {
+            if (!photo_taken) continue;
+            Mat base = drawing_mode ? captured_image : filtered_image;
+            Mat merged; // 濾鏡 + 筆跡 + 文字
+            Mat temp_base;
+            blendLayers(base, drawing_layer, temp_base);
+
+            Mat text_layer(output_height, output_width, CV_8UC3, Scalar(0, 0, 0, 0));
+            drawTextBoxes(text_layer);
+
+            Mat text_layer_bgra;
+            cvtColor(text_layer, text_layer_bgra, COLOR_BGR2BGRA);
+
+            blendLayers(temp_base, text_layer_bgra, merged);
+
+            imwrite("saved_image.jpg", merged);
+            cout << "已存檔 saved_image.jpg\n";
+        }
+
+        else if (key == 97) { // left arrow
+            color_page = (color_page - 1 + 4) % 4;
+        }
+        else if (key == 100) { // right arrow
+            color_page = (color_page + 1) % 4;
+        }
+
+        if (selectedIndex >= 0 && !editing) {
+            if (key == 'l') textBoxes[selectedIndex].align = 0;
+            else if (key == 'c') textBoxes[selectedIndex].align = 1;
+            else if (key == 'r') textBoxes[selectedIndex].align = 2;
+        }
+
+        if (editing && selectedIndex >= 0) {
+            if (key == 8 || key == 127) { // Backspace
+                if (!textBoxes[selectedIndex].text.empty()) {
+                    textBoxes[selectedIndex].text.pop_back();
+                }
+            }
+            else if (key == 13 || key == 10) { // Enter -> 換行
+                textBoxes[selectedIndex].text.push_back('\n');
+            }
+            else if (key >= 32 && key <= 126) { // 一般可印字元
+                textBoxes[selectedIndex].text.push_back((char)key);
+            }
+        }
+
+        if (photo_taken && selectedIndex >= 0) {
+            if (!fontSizeTrackbarCreated) {                 // ← 加這層判斷
+                createTrackbar("Font Size", "IG Camera",
+                    &textBoxes[selectedIndex].fontSize,
+                    100, onFontSize);
+                fontSizeTrackbarCreated = true;             // ← 只建一次
+            }
+            setTrackbarPos("Font Size", "IG Camera",
+                textBoxes[selectedIndex].fontSize);
+        }
+
+    }
+
+    cap.release();
+    destroyAllWindows();
+    return 0;
+}
+
+
+
